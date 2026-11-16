@@ -2549,7 +2549,7 @@
         try {
           const { data } = await withTimeout(
             sb.from("app_settings").select("*").eq("id", 1).maybeSingle(),
-            3500
+            2500
           );
           if (data) {
             state.globalSiteLocked = Boolean(data.global_lock);
@@ -2560,26 +2560,30 @@
       }
 
       async function ensureCurrentUserProfile(userId, authUser = null) {
-        if (state.users[userId]) return;
-        const emailPrefix = (authUser?.email || "user").split("@")[0];
-        const fallbackName = authUser?.user_metadata?.full_name || emailPrefix;
-        const fallbackUser = authUser?.user_metadata?.username || emailPrefix;
+        if (!sb || state.users[userId]) return;
+        try {
+          const emailPrefix = (authUser?.email || "user").split("@")[0];
+          const fallbackName = authUser?.user_metadata?.full_name || emailPrefix;
+          const fallbackUser = authUser?.user_metadata?.username || emailPrefix;
 
-        const { data: upserted } = await sb
-          .from("profiles")
-          .upsert({
-            id: userId,
-            full_name: fallbackName,
-            username: fallbackUser,
-            is_online: true,
-            last_seen: new Date().toISOString()
-          })
-          .select()
-          .maybeSingle();
+          const { data: upserted } = await withTimeout(
+            sb.from("profiles")
+              .upsert({
+                id: userId,
+                full_name: fallbackName,
+                username: fallbackUser,
+                is_online: true,
+                last_seen: new Date().toISOString()
+              })
+              .select()
+              .maybeSingle(),
+            3500
+          );
 
-        if (upserted) {
-          state.users[userId] = mapProfileFromDB(upserted);
-        }
+          if (upserted) {
+            state.users[userId] = mapProfileFromDB(upserted);
+          }
+        } catch (_) {}
       }
 
       async function fetchAllCloudData() {
@@ -2588,23 +2592,25 @@
 
         await fetchGlobalAppSettings();
 
-        const { data: profilesData } = await sb.from("profiles").select("*");
-        if (profilesData) {
+        const [profilesRes, chatsRes] = await withTimeout(
+          Promise.all([
+            sb.from("profiles").select("*"),
+            sb.from("chats").select("*").contains("participants", [meId])
+          ]),
+          5000
+        );
+
+        if (profilesRes?.data) {
           const nextUsers = {};
-          profilesData.forEach((row) => {
+          profilesRes.data.forEach((row) => {
             nextUsers[row.id] = mapProfileFromDB(row);
           });
           state.users = nextUsers;
         }
 
-        const { data: chatsData } = await sb
-          .from("chats")
-          .select("*")
-          .contains("participants", [meId]);
-
-        if (chatsData) {
+        if (chatsRes?.data) {
           const nextChats = {};
-          chatsData.forEach((row) => {
+          chatsRes.data.forEach((row) => {
             nextChats[row.id] = mapChatFromDB(row);
           });
           state.chats = nextChats;
@@ -2612,11 +2618,13 @@
 
         const chatIds = Object.keys(state.chats);
         if (chatIds.length > 0) {
-          const { data: msgsData } = await sb
-            .from("messages")
-            .select("*")
-            .in("chat_id", chatIds)
-            .order("created_at", { ascending: true });
+          const { data: msgsData } = await withTimeout(
+            sb.from("messages")
+              .select("*")
+              .in("chat_id", chatIds)
+              .order("created_at", { ascending: true }),
+            5000
+          );
 
           if (msgsData) {
             const nextMsgs = {};
@@ -2640,7 +2648,7 @@
         }
 
         realtimeChannel = sb
-          .channel("wa_cloud_realtime_v4")
+          .channel("wa_cloud_realtime_v5")
           .on("postgres_changes", { event: "*", schema: "public", table: "app_settings" }, (payload) => {
             if (payload.new) {
               state.globalSiteLocked = Boolean(payload.new.global_lock);
@@ -3116,23 +3124,52 @@
         state.currentUserId = userId;
         state.activeChatId = null;
 
-        await withTimeout(fetchAllCloudData(), 6000);
-        await ensureCurrentUserProfile(userId, authUser);
+        // Seed immediate fallback profile so the UI can open instantly without blocking
+        if (!state.users[userId]) {
+          const emailPrefix = (authUser?.email || "user").split("@")[0];
+          state.users[userId] = {
+            id: userId,
+            fullName: authUser?.user_metadata?.full_name || emailPrefix,
+            username: authUser?.user_metadata?.username || emailPrefix,
+            bio: "",
+            themeColor: "#00a884",
+            avatarUrl: null,
+            isBanned: false,
+            joinedAt: Date.now(),
+            lastSeen: Date.now(),
+            isOnline: true,
+            privacy: { lastSeen: true, online: true, readReceipts: true },
+            blockedUsers: []
+          };
+        }
+
         syncAdminModePersistence();
         enforceSystemLockAndBan();
 
-        await getOrCreateSelfChat();
-        setupRealtimeSubscriptions();
-        updateMyPresence(true);
-        markMessagesDeliveredAndRead();
-
+        // Hide loader and show app immediately
         $("loadingScreen").classList.add("hidden");
         $("authScreen").classList.add("hidden");
-        const me = state.users[userId];
-        if (!me || !me.isBanned || state.isAdminMode) {
+        const meNow = state.users[userId];
+        if (!meNow || !meNow.isBanned || state.isAdminMode) {
           $("appShell").classList.remove("hidden");
         }
         renderAll();
+
+        // Sync full cloud data & realtime in the background safely
+        try {
+          await fetchAllCloudData();
+        } catch (err) {
+          console.warn("Initial cloud sync notice:", err);
+        }
+
+        await ensureCurrentUserProfile(userId, authUser);
+        enforceSystemLockAndBan();
+        renderAll();
+
+        getOrCreateSelfChat().then(() => renderSidebar()).catch(() => {});
+        setupRealtimeSubscriptions();
+        updateMyPresence(true).catch(() => {});
+        markMessagesDeliveredAndRead().catch(() => {});
       }
 
       /* ===================== CHAT & CONVERSATION HELPERS ===================== */
@@ -3146,19 +3183,25 @@
         const existingLocal = Object.values(state.chats).find((c) => isSelfChat(c));
         if (existingLocal) return existingLocal;
 
-        const { data: inserted, error } = await sb
-          .from("chats")
-          .insert({
-            type: "private",
-            participants: [meId]
-          })
-          .select()
-          .maybeSingle();
+        try {
+          const { data: inserted, error } = await withTimeout(
+            sb.from("chats")
+              .insert({
+                type: "private",
+                participants: [meId]
+              })
+              .select()
+              .maybeSingle(),
+            4000
+          );
 
-        if (error || !inserted) return null;
-        const mapped = mapChatFromDB(inserted);
-        state.chats[mapped.id] = mapped;
-        return mapped;
+          if (error || !inserted) return null;
+          const mapped = mapChatFromDB(inserted);
+          state.chats[mapped.id] = mapped;
+          return mapped;
+        } catch (_) {
+          return null;
+        }
       }
 
       async function getOrCreatePrivateChat(otherUserId) {
@@ -5084,7 +5127,7 @@
           recordingInterval = setInterval(() => {
             recordingSeconds++;
             const m = String(Math.floor(recordingSeconds / 60)).padStart(2, "0");
-            const s = String(recordingSeconds % 60).padStart(2, "0");
+            const s = String(Math.floor(recordingSeconds % 60)).padStart(2, "0");
             $("recordingTimer").textContent = `${m}:${s}`;
             if (recordingSeconds >= 120) stopVoiceRecording(true);
           }, 1000);
@@ -5514,8 +5557,10 @@
               <p style="margin-top:10px;font-size:13.5px;color:var(--text-secondary);">מרחב אישי לשמירת הודעות, קבצים ותמונות.</p>
             </div>
             <div class="drawer-section">
-              <div style="font-weight:700;font-size:13px;color:var(--accent);margin-bottom:6px;">מדיה שמורה (${mediaMsgs.length})</div>
-              ${mediaMsgs.length ? `<div class="media-grid-mini">${mediaMsgs.slice(-9).map((m) => `<img src="${escapeHtml(m.mediaUrl)}" data-drawer-img="${escapeHtml(m.mediaUrl)}" />`).join("")}</div>` : `<div style="font-size:13px;color:var(--text-muted);">אין תמונות שמורות</div>`}
+              <div style="font-weight:700;font-size:13px;color:var(--accent);margin-bottom:8px;">תמונות שמורות (${mediaMsgs.length})</div>
+              <div class="media-grid-mini">
+                ${mediaMsgs.slice(0, 9).map((m) => `<img src="${escapeHtml(m.mediaUrl)}" alt="מדיה" />`).join("") || `<span style="font-size:12.5px;color:var(--text-muted);grid-column:1/-1;">אין תמונות שמורות</span>`}
+              </div>
             </div>
           `);
           return;
@@ -5534,17 +5579,19 @@
               ${renderAvatarHTML(other, "xl", isUserVisiblyOnline(other))}
               <h3 style="margin-top:12px;font-size:19px;">${escapeHtml(other.fullName)}</h3>
               <div style="color:var(--text-muted);font-size:13px;" dir="ltr">@${escapeHtml(other.username)}</div>
-              <div style="color:var(--accent);font-size:12.5px;margin-top:4px;">${escapeHtml(getUserStatusLabel(other))}</div>
+              <div style="margin-top:6px;font-size:13px;color:var(--accent);">${escapeHtml(getUserStatusLabel(other))}</div>
             </div>
 
             <div class="drawer-section">
-              <div style="font-size:12.5px;color:var(--text-muted);">אודות</div>
-              <div style="font-size:14.5px;margin-top:4px;">${escapeHtml(other.bio || "אין תיאור")}</div>
+              <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">אודות</div>
+              <div style="font-size:14.5px;">${escapeHtml(other.bio || "אין תיאור")}</div>
             </div>
 
             <div class="drawer-section">
-              <div style="font-weight:700;font-size:13px;color:var(--accent);margin-bottom:6px;">מדיה משותפת (${mediaMsgs.length})</div>
-              ${mediaMsgs.length ? `<div class="media-grid-mini">${mediaMsgs.slice(-9).map((m) => `<img src="${escapeHtml(m.mediaUrl)}" data-drawer-img="${escapeHtml(m.mediaUrl)}" />`).join("")}</div>` : `<div style="font-size:13px;color:var(--text-muted);">אין תמונות משותפות</div>`}
+              <div style="font-weight:700;font-size:13px;color:var(--accent);margin-bottom:8px;">מדיה משותפת (${mediaMsgs.length})</div>
+              <div class="media-grid-mini">
+                ${mediaMsgs.slice(0, 9).map((m) => `<img src="${escapeHtml(m.mediaUrl)}" alt="מדיה" />`).join("") || `<span style="font-size:12.5px;color:var(--text-muted);grid-column:1/-1;">אין תמונות בשיחה זו</span>`}
+              </div>
             </div>
 
             <div class="drawer-section">
@@ -5555,34 +5602,37 @@
                   <span class="slider"></span>
                 </label>
               </div>
-              <div style="margin-top:14px;display:flex;flex-direction:column;gap:8px;">
-                <button type="button" id="btnToggleBlockUser" class="${blocked ? "btn-secondary" : "btn-danger"}" style="width:100%;">
-                  ${blocked ? "בטל חסימת משתמש" : "חסום משתמש זה"}
+              <div style="margin-top:14px;display:flex;flex-direction:column;gap:10px;">
+                <button type="button" id="toggleBlockUserBtn" class="${blocked ? "btn-secondary" : "btn-danger"}" style="width:100%;">
+                  ${blocked ? `בטל חסימה של ${escapeHtml(other.fullName)}` : `חסום את ${escapeHtml(other.fullName)}`}
                 </button>
               </div>
             </div>
           `);
 
           $("mutePrivateChatSwitch").onchange = async (e) => {
-            const nextMuted = e.target.checked
-              ? [...new Set([...(chat.mutedBy || []), meId])]
-              : (chat.mutedBy || []).filter((id) => id !== meId);
-            chat.mutedBy = nextMuted;
+            const mutedBy = new Set(chat.mutedBy || []);
+            if (e.target.checked) mutedBy.add(meId);
+            else mutedBy.delete(meId);
+            chat.mutedBy = [...mutedBy];
             renderSidebar();
-            await sb.from("chats").update({ muted_by: nextMuted }).eq("id", chat.id);
+            await sb.from("chats").update({ muted_by: chat.mutedBy }).eq("id", chat.id);
           };
 
-          $("btnToggleBlockUser").onclick = async () => {
+          $("toggleBlockUserBtn").onclick = async () => {
             const me = state.users[meId];
-            let nextBlocked = [...(me.blockedUsers || [])];
-            const idx = nextBlocked.indexOf(other.id);
-            if (idx >= 0) nextBlocked.splice(idx, 1);
-            else nextBlocked.push(other.id);
-            me.blockedUsers = nextBlocked;
-            await sb.from("profiles").update({ blocked_users: nextBlocked }).eq("id", me.id);
+            const set = new Set(me.blockedUsers || []);
+            if (set.has(other.id)) {
+              set.delete(other.id);
+              showToast(`החסימה של ${other.fullName} בוטלה.`);
+            } else {
+              set.add(other.id);
+              showToast(`${other.fullName} נחסם.`);
+            }
+            me.blockedUsers = [...set];
+            await sb.from("profiles").update({ blocked_users: me.blockedUsers }).eq("id", me.id);
             renderActiveChat();
             openChatInfoDrawer();
-            showToast(idx >= 0 ? `הוסרה החסימה מ-${other.fullName}.` : `${other.fullName} נחסם.`);
           };
         } else {
           const isAdmin = (chat.admins || []).includes(meId);
@@ -5591,40 +5641,43 @@
 
           openDrawer("פרטי קבוצה", `
             <div class="drawer-section" style="text-align:center;">
-              <div style="position:relative;display:inline-block;${isAdmin ? "cursor:pointer;" : ""}" id="groupAvatarDrawerWrap">
+              <div style="position:relative;display:inline-block;cursor:${isAdmin ? "pointer" : "default"};" id="groupAvatarWrap">
                 ${renderAvatarHTML({ name: chat.name, avatarUrl: chat.avatarUrl, themeColor: "#008069" }, "xl", false)}
                 ${isAdmin ? `<div style="position:absolute;bottom:4px;left:4px;background:var(--accent);color:#fff;width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;">📷</div>` : ""}
               </div>
-              <input type="file" id="groupAvatarChangeInput" accept="image/*" class="hidden" />
+              <input type="file" id="groupAvatarInput" accept="image/*" class="hidden" />
               ${isAdmin ? `
-                <div style="margin-top:12px;">
-                  <input type="text" id="editGroupNameInput" class="form-control" value="${escapeHtml(chat.name)}" style="text-align:center;font-weight:700;" />
-                  <input type="text" id="editGroupDescInput" class="form-control" value="${escapeHtml(chat.description || "")}" placeholder="תיאור הקבוצה" style="margin-top:6px;text-align:center;font-size:13px;" />
-                  <button type="button" id="saveGroupMetaBtn" class="btn-secondary" style="margin-top:8px;width:100%;">שמור פרטי קבוצה</button>
+                <div style="margin-top:12px;display:flex;flex-direction:column;gap:8px;">
+                  <input type="text" id="editGroupNameInput" class="form-control" value="${escapeHtml(chat.name)}" maxlength="45" placeholder="שם הקבוצה" />
+                  <input type="text" id="editGroupDescInput" class="form-control" value="${escapeHtml(chat.description || "")}" maxlength="120" placeholder="תיאור הקבוצה (אופציונלי)" />
+                  <button type="button" id="saveGroupMetaBtn" class="btn-primary">שמור פרטי קבוצה</button>
                 </div>
               ` : `
-                <h3 style="margin-top:12px;">${escapeHtml(chat.name)}</h3>
-                <p style="font-size:13.5px;color:var(--text-secondary);margin-top:4px;">${escapeHtml(chat.description || "")}</p>
+                <h3 style="margin-top:12px;font-size:19px;">${escapeHtml(chat.name)}</h3>
+                ${chat.description ? `<p style="margin-top:6px;font-size:13.5px;color:var(--text-secondary);">${escapeHtml(chat.description)}</p>` : ""}
               `}
             </div>
 
             <div class="drawer-section">
-              <div style="font-weight:700;font-size:13px;color:var(--accent);margin-bottom:6px;">מדיה בקבוצה (${mediaMsgs.length})</div>
-              ${mediaMsgs.length ? `<div class="media-grid-mini">${mediaMsgs.slice(-9).map((m) => `<img src="${escapeHtml(m.mediaUrl)}" data-drawer-img="${escapeHtml(m.mediaUrl)}" />`).join("")}</div>` : `<div style="font-size:13px;color:var(--text-muted);">אין תמונות משותפות</div>`}
+              <div style="font-weight:700;font-size:13px;color:var(--accent);margin-bottom:8px;">מדיה משותפת (${mediaMsgs.length})</div>
+              <div class="media-grid-mini">
+                ${mediaMsgs.slice(0, 9).map((m) => `<img src="${escapeHtml(m.mediaUrl)}" alt="מדיה" />`).join("") || `<span style="font-size:12.5px;color:var(--text-muted);grid-column:1/-1;">אין תמונות בקבוצה זו</span>`}
+              </div>
             </div>
 
             <div class="drawer-section">
               <div class="setting-row">
-                <span style="font-weight:600;">השתק התראות קבוצה</span>
+                <span style="font-weight:600;">השתק התראות מקבוצה זו</span>
                 <label class="switch">
-                  <input type="checkbox" id="muteGroupSwitch" ${isMuted ? "checked" : ""} />
+                  <input type="checkbox" id="muteGroupChatSwitch" ${isMuted ? "checked" : ""} />
                   <span class="slider"></span>
                 </label>
               </div>
               ${isAdmin ? `
                 <div class="setting-row">
                   <div>
-                    <div style="font-weight:600;">רק מנהלים יכולים לשלוח הודעות</div>
+                    <div style="font-weight:600;">שליחת הודעות למנהלים בלבד</div>
+                    <div style="font-size:12px;color:var(--text-secondary);">רק מנהלים יוכלו לכתוב בקבוצה</div>
                   </div>
                   <label class="switch">
                     <input type="checkbox" id="onlyAdminsSendSwitch" ${chat.onlyAdminsSend ? "checked" : ""} />
@@ -5636,32 +5689,33 @@
 
             <div class="drawer-section">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-                <span style="font-weight:700;font-size:13.5px;color:var(--accent);">משתתפים (${chat.participants.length})</span>
-                ${isAdmin ? `<button type="button" id="btnAddGroupMember" class="btn-secondary" style="padding:5px 10px;font-size:12.5px;">+ הוסף משתתף</button>` : ""}
+                <span style="font-weight:700;font-size:13px;color:var(--accent);">משתתפים (${chat.participants.length})</span>
+                ${isAdmin ? `<button type="button" id="btnAddGroupMember" class="btn-secondary" style="padding:5px 10px;font-size:12px;">+ הוסף משתתף</button>` : ""}
               </div>
-              ${chat.participants.map((pid) => {
-                const u = state.users[pid];
-                if (!u) return "";
-                const pIsAdmin = (chat.admins || []).includes(pid);
-                return `
-                  <div class="setting-row">
-                    <div style="display:flex;align-items:center;gap:10px;min-width:0;">
-                      ${renderAvatarHTML(u, "sm", isUserVisiblyOnline(u))}
-                      <div style="min-width:0;">
-                        <div style="font-weight:600;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(u.fullName)} ${pid === meId ? "(את/ה)" : ""}</div>
-                        <div style="font-size:11.5px;color:var(--text-muted);" dir="ltr">@${escapeHtml(u.username)}</div>
+              <div style="display:flex;flex-direction:column;gap:8px;">
+                ${chat.participants.map((pid) => {
+                  const u = state.users[pid];
+                  if (!u) return "";
+                  const memberIsAdmin = (chat.admins || []).includes(pid);
+                  return `
+                    <div class="setting-row">
+                      <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                        ${renderAvatarHTML(u, "sm", isUserVisiblyOnline(u))}
+                        <div style="min-width:0;">
+                          <div style="font-weight:600;font-size:14px;">${escapeHtml(u.fullName)} ${pid === meId ? "(את/ה)" : ""}</div>
+                          <div style="font-size:11.5px;color:var(--text-muted);">${memberIsAdmin ? "מנהל קבוצה" : escapeHtml(u.bio || "")}</div>
+                        </div>
                       </div>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:6px;">
-                      ${pIsAdmin ? `<span class="chip active" style="font-size:11px;">מנהל</span>` : ""}
                       ${isAdmin && pid !== meId ? `
-                        <button type="button" class="btn-secondary" style="padding:3px 7px;font-size:11px;" data-toggle-admin="${pid}">${pIsAdmin ? "הסר ניהול" : "מנה למנהל"}</button>
-                        <button type="button" class="btn-danger" style="padding:3px 7px;font-size:11px;" data-remove-member="${pid}">הסר</button>
+                        <div style="display:flex;gap:4px;">
+                          <button type="button" class="btn-secondary" style="padding:4px 8px;font-size:11.5px;" data-toggle-admin="${pid}">${memberIsAdmin ? "הסר ניהול" : "מנה למנהל"}</button>
+                          <button type="button" class="btn-danger" style="padding:4px 8px;font-size:11.5px;" data-remove-member="${pid}">הסר</button>
+                        </div>
                       ` : ""}
                     </div>
-                  </div>
-                `;
-              }).join("")}
+                  `;
+                }).join("")}
+              </div>
             </div>
 
             <div class="drawer-section">
@@ -5670,364 +5724,254 @@
           `);
 
           if (isAdmin) {
-            $("groupAvatarDrawerWrap").onclick = () => $("groupAvatarChangeInput").click();
-            $("groupAvatarChangeInput").onchange = async (e) => {
+            $("groupAvatarWrap").onclick = () => $("groupAvatarInput").click();
+            $("groupAvatarInput").onchange = async (e) => {
               const file = e.target.files[0];
               if (!file) return;
-              showToast("מעלה תמונת קבוצה...");
               try {
                 const url = await uploadMediaToCloud(file, "groups", file.name);
-                const { error: grpImgErr } = await sb
-                  .from("chats")
-                  .update({ avatar_url: url, updated_at: new Date().toISOString() })
-                  .eq("id", chat.id);
-                if (grpImgErr) {
-                  showToast("שגיאה בעדכון תמונת הקבוצה: " + grpImgErr.message);
-                  return;
-                }
                 chat.avatarUrl = url;
+                await sb.from("chats").update({ avatar_url: url }).eq("id", chat.id);
                 renderAll();
                 openChatInfoDrawer();
-                showToast("תמונת הקבוצה עודכנה.");
               } catch (err) {
-                showToast(err.message || "שגיאה בהעלאת התמונה.");
+                showToast(err.message || "שגיאה בעדכון תמונת הקבוצה.");
               }
             };
 
             $("saveGroupMetaBtn").onclick = async () => {
-              const n = $("editGroupNameInput").value.trim();
-              const d = $("editGroupDescInput").value.trim();
-              if (!n) return;
-              const { error: grpMetaErr } = await sb
-                .from("chats")
-                .update({ name: n, description: d, updated_at: new Date().toISOString() })
-                .eq("id", chat.id);
-              if (grpMetaErr) {
-                showToast("שגיאה בשמירת פרטי הקבוצה: " + grpMetaErr.message);
-                return;
-              }
-              chat.name = n;
-              chat.description = d;
+              const newName = $("editGroupNameInput").value.trim();
+              const newDesc = $("editGroupDescInput").value.trim();
+              if (!newName) return;
+              chat.name = newName;
+              chat.description = newDesc;
+              await sb.from("chats").update({ name: newName, description: newDesc }).eq("id", chat.id);
               renderAll();
               showToast("פרטי הקבוצה עודכנו.");
             };
 
             $("onlyAdminsSendSwitch").onchange = async (e) => {
-              const val = e.target.checked;
-              const { error } = await sb
-                .from("chats")
-                .update({ only_admins_send: val, updated_at: new Date().toISOString() })
-                .eq("id", chat.id);
-              if (error) {
-                showToast("שגיאה בעדכון הגדרת הקבוצה.");
-                return;
-              }
-              chat.onlyAdminsSend = val;
+              chat.onlyAdminsSend = e.target.checked;
+              await sb.from("chats").update({ only_admins_send: chat.onlyAdminsSend }).eq("id", chat.id);
               renderActiveChat();
+              showToast(chat.onlyAdminsSend ? "הקבוצה הוגדרה למנהלים בלבד." : "כל המשתתפים יכולים לשלוח הודעות.");
             };
 
-            $("btnAddGroupMember").onclick = () => {
-              const candidates = Object.values(state.users).filter((u) => !chat.participants.includes(u.id));
-              if (candidates.length === 0) {
-                showToast("כל המשתמשים הרשומים כבר נמצאים בקבוצה.");
-                return;
-              }
-              openModal(`
-                <div class="modal-header">
-                  <span class="modal-title">הוספת משתתף לקבוצה</span>
-                  <button type="button" class="icon-btn" id="closeAddMem">✕</button>
-                </div>
-                <div style="display:flex;flex-direction:column;gap:8px;max-height:300px;overflow-y:auto;">
-                  ${candidates.map((u) => `
-                    <button type="button" class="existing-user-item" data-add-uid="${u.id}">
-                      ${renderAvatarHTML(u, "sm", isUserVisiblyOnline(u))}
-                      <span style="flex:1;font-weight:600;">${escapeHtml(u.fullName)}</span>
-                      <span style="color:var(--accent);font-weight:700;">+ הוסף</span>
-                    </button>
-                  `).join("")}
-                </div>
-              `);
-              $("closeAddMem").onclick = closeModal;
-              $("modalContent").querySelectorAll("[data-add-uid]").forEach((btn) => {
-                btn.onclick = async () => {
-                  const uid = btn.dataset.addUid;
-                  const nextParticipants = [...chat.participants, uid];
-                  const { error } = await sb
-                    .from("chats")
-                    .update({ participants: nextParticipants, updated_at: new Date().toISOString() })
-                    .eq("id", chat.id);
-                  if (error) {
-                    showToast("שגיאה בהוספת משתתף: " + error.message);
-                    return;
-                  }
-                  chat.participants = nextParticipants;
-                  await sb.from("messages").insert({
-                    chat_id: chat.id,
-                    sender_id: meId,
-                    type: "system",
-                    text: `${state.users[uid]?.fullName || "משתמש"} צורף/ה לקבוצה`
-                  });
-                  closeModal();
-                  openChatInfoDrawer();
-                  renderAll();
-                };
-              });
-            };
-
-            $("drawerBody").querySelectorAll("[data-toggle-admin]").forEach((btn) => {
-              btn.onclick = async () => {
-                const uid = btn.dataset.toggleAdmin;
-                let nextAdmins = [...(chat.admins || [])];
-                const idx = nextAdmins.indexOf(uid);
-                if (idx >= 0) nextAdmins.splice(idx, 1);
-                else nextAdmins.push(uid);
-                const { error } = await sb
-                  .from("chats")
-                  .update({ admins: nextAdmins, updated_at: new Date().toISOString() })
-                  .eq("id", chat.id);
-                if (error) {
-                  showToast("שגיאה בעדכון מנהלי הקבוצה.");
-                  return;
-                }
-                chat.admins = nextAdmins;
-                openChatInfoDrawer();
-              };
-            });
-
-            $("drawerBody").querySelectorAll("[data-remove-member]").forEach((btn) => {
-              btn.onclick = async () => {
-                const uid = btn.dataset.removeMember;
-                const nextParticipants = chat.participants.filter((id) => id !== uid);
-                const nextAdmins = (chat.admins || []).filter((id) => id !== uid);
-                const { error } = await sb
-                  .from("chats")
-                  .update({
-                    participants: nextParticipants,
-                    admins: nextAdmins,
-                    updated_at: new Date().toISOString()
-                  })
-                  .eq("id", chat.id);
-                if (error) {
-                  showToast("שגיאה בהסרת משתתף: " + error.message);
-                  return;
-                }
-                chat.participants = nextParticipants;
-                chat.admins = nextAdmins;
-                await sb.from("messages").insert({
-                  chat_id: chat.id,
-                  sender_id: meId,
-                  type: "system",
-                  text: `${state.users[uid]?.fullName || "משתמש"} הוסר/ה מהקבוצה`
-                });
-                openChatInfoDrawer();
-                renderAll();
-              };
-            });
+            $("btnAddGroupMember").onclick = () => showAddMemberModal(chat);
           }
 
-          $("muteGroupSwitch").onchange = async (e) => {
-            const nextMuted = e.target.checked
-              ? [...new Set([...(chat.mutedBy || []), meId])]
-              : (chat.mutedBy || []).filter((id) => id !== meId);
-            chat.mutedBy = nextMuted;
+          $("muteGroupChatSwitch").onchange = async (e) => {
+            const mutedBy = new Set(chat.mutedBy || []);
+            if (e.target.checked) mutedBy.add(meId);
+            else mutedBy.delete(meId);
+            chat.mutedBy = [...mutedBy];
             renderSidebar();
-            await sb.from("chats").update({ muted_by: nextMuted }).eq("id", chat.id);
+            await sb.from("chats").update({ muted_by: chat.mutedBy }).eq("id", chat.id);
           };
 
+          $("drawerBody").querySelectorAll("[data-toggle-admin]").forEach((btn) => {
+            btn.onclick = async () => {
+              const pid = btn.dataset.toggleAdmin;
+              const admins = new Set(chat.admins || []);
+              if (admins.has(pid)) admins.delete(pid);
+              else admins.add(pid);
+              chat.admins = [...admins];
+              await sb.from("chats").update({ admins: chat.admins }).eq("id", chat.id);
+              openChatInfoDrawer();
+            };
+          });
+
+          $("drawerBody").querySelectorAll("[data-remove-member]").forEach((btn) => {
+            btn.onclick = async () => {
+              const pid = btn.dataset.removeMember;
+              chat.participants = chat.participants.filter((id) => id !== pid);
+              chat.admins = (chat.admins || []).filter((id) => id !== pid);
+              await sb.from("chats").update({
+                participants: chat.participants,
+                admins: chat.admins
+              }).eq("id", chat.id);
+              renderAll();
+              openChatInfoDrawer();
+            };
+          });
+
           $("btnLeaveGroup").onclick = async () => {
-            const me = state.users[meId];
+            const btnLeave = $("btnLeaveGroup");
+            btnLeave.disabled = true;
+            btnLeave.textContent = "יוצא מהקבוצה...";
 
-            // Try secure RPC first (bypasses client-side RLS WITH CHECK issues)
-            const { error: rpcErr } = await sb.rpc("leave_group_chat", { target_chat_id: chat.id });
-
-            if (rpcErr) {
-              // Fallback to direct table update if RPC is not installed yet
-              const nextParticipants = chat.participants.filter((id) => id !== meId);
+            try {
+              const nextParticipants = (chat.participants || []).filter((id) => id !== meId);
               let nextAdmins = (chat.admins || []).filter((id) => id !== meId);
               if (nextAdmins.length === 0 && nextParticipants.length > 0) {
                 nextAdmins = [nextParticipants[0]];
               }
 
-              const { error: updErr } = await sb
-                .from("chats")
-                .update({
+              const { error: rpcErr } = await sb.rpc("leave_group_chat", {
+                target_chat_id: String(chat.id)
+              });
+
+              if (rpcErr) {
+                const { error: updErr } = await sb.from("chats").update({
                   participants: nextParticipants,
-                  admins: nextAdmins,
-                  updated_at: new Date().toISOString()
-                })
-                .eq("id", chat.id);
+                  admins: nextAdmins
+                }).eq("id", chat.id);
 
-              if (updErr) {
-                showToast("שגיאה ביציאה מהקבוצה. ודא שהרצת את סקריפט ה-SQL המעודכן ב-Supabase.");
-                return;
+                if (updErr) {
+                  throw updErr;
+                }
               }
-            }
 
-            if (chat.participants.filter((id) => id !== meId).length > 0) {
-              await sb.from("messages").insert({
-                chat_id: chat.id,
-                sender_id: meId,
-                type: "system",
-                text: `${me?.fullName || "משתמש"} עזב/ה את הקבוצה`
-              }).catch(() => {});
+              delete state.chats[chat.id];
+              closeDrawer();
+              closeChatMobile();
+              renderAll();
+              showToast("יצאת מהקבוצה בהצלחה.");
+            } catch (err) {
+              console.error("Leave group error:", err);
+              btnLeave.disabled = false;
+              btnLeave.textContent = "צא מהקבוצה";
+              showToast("שגיאה ביציאה מהקבוצה: " + (err?.message || "נסה לרענן"));
             }
-
-            delete state.chats[chat.id];
-            closeDrawer();
-            closeChatMobile();
-            renderAll();
-            showToast("יצאת מהקבוצה.");
           };
         }
-
-        $("drawerBody").querySelectorAll("[data-drawer-img]").forEach((img) => {
-          img.onclick = () => {
-            const src = img.dataset.drawerImg;
-            openModal(`<div style="text-align:center;"><img src="${escapeHtml(src)}" class="lightbox-img" /><div style="margin-top:10px;"><button type="button" class="btn-secondary" id="closeDrawerImgBtn">סגור</button></div></div>`, true);
-            $("closeDrawerImgBtn").onclick = closeModal;
-          };
-        });
       }
 
-      /* ===================== CREATE NEW GROUP MODAL ===================== */
-      function showCreateGroupModal() {
+      /* ===================== GROUP CREATION & ADD MEMBER MODALS ===================== */
+      function showNewGroupModal() {
         const meId = state.currentUserId;
-        const others = Object.values(state.users).filter((u) => u.id !== meId);
-        let groupAvatarFile = null;
+        const others = Object.values(state.users).filter((u) => u.id !== meId && !u.isBanned);
 
         openModal(`
           <div class="modal-header">
             <span class="modal-title">יצירת קבוצה חדשה</span>
-            <button type="button" class="icon-btn" id="closeNewGrpModal">✕</button>
-          </div>
-          <div style="text-align:center;margin-bottom:14px;">
-            <div id="newGrpAvatarPreview" class="avatar-preview-lg" style="background:#008069;margin:0 auto;width:78px;height:78px;font-size:26px;" title="תמונת קבוצה">
-              <span id="newGrpInitials">👥</span>
-              <img id="newGrpImg" class="hidden" alt="תמונת קבוצה" />
-            </div>
-            <input type="file" id="newGrpAvatarInput" accept="image/*" class="hidden" />
-            <div style="font-size:11.5px;color:var(--text-muted);margin-top:5px;">לחץ לבחירת תמונת קבוצה (אופציונלי)</div>
+            <button type="button" class="icon-btn" id="closeGroupModal">✕</button>
           </div>
           <div class="form-group">
             <label>שם הקבוצה *</label>
-            <input type="text" id="newGrpName" class="form-control" placeholder="לדוגמה: צוות פיתוח / חברים" maxlength="45" />
+            <input type="text" id="newGroupName" class="form-control" placeholder="לדוגמה: צוות פיתוח / חברים" maxlength="45" />
           </div>
           <div class="form-group">
             <label>תיאור הקבוצה (אופציונלי)</label>
-            <input type="text" id="newGrpDesc" class="form-control" placeholder="על מה הקבוצה?" maxlength="100" />
+            <input type="text" id="newGroupDesc" class="form-control" placeholder="מטרת הקבוצה..." maxlength="120" />
           </div>
           <div class="form-group">
             <label>בחר משתתפים לקבוצה:</label>
-            <div style="max-height:200px;overflow-y:auto;border:1px solid var(--border-color);border-radius:10px;padding:6px;">
-              ${others.length === 0 ? `<div style="padding:12px;text-align:center;color:var(--text-muted);font-size:13px;">אין משתמשים נוספים רשומים עדיין.</div>` : others.map((u) => `
-                <label class="setting-row" style="cursor:pointer;padding:8px;">
-                  <div style="display:flex;align-items:center;gap:10px;">
+            <div style="max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;">
+              ${others.length === 0
+                ? `<div style="font-size:13px;color:var(--text-muted);">אין עדיין משתמשים נוספים במערכת.</div>`
+                : others.map((u) => `
+                  <label class="existing-user-item" style="cursor:pointer;">
+                    <input type="checkbox" value="${u.id}" class="group-member-cb" style="width:18px;height:18px;accent-color:var(--accent);" />
                     ${renderAvatarHTML(u, "sm", isUserVisiblyOnline(u))}
-                    <span style="font-weight:600;font-size:13.5px;">${escapeHtml(u.fullName)}</span>
-                  </div>
-                  <input type="checkbox" class="grp-member-cb" value="${u.id}" style="width:18px;height:18px;accent-color:var(--accent);" />
-                </label>
-              `).join("")}
+                    <span style="flex:1;font-weight:600;">${escapeHtml(u.fullName)}</span>
+                  </label>
+                `).join("")}
             </div>
           </div>
           <div class="modal-actions">
-            <button type="button" class="btn-secondary" id="cancelNewGrpBtn">ביטול</button>
-            <button type="button" class="btn-primary" id="submitNewGrpBtn" style="width:auto;">צור קבוצה</button>
+            <button type="button" class="btn-secondary" id="cancelGroupBtn">ביטול</button>
+            <button type="button" class="btn-primary" id="createGroupSubmitBtn" style="width:auto;">צור קבוצה</button>
           </div>
         `);
 
-        $("closeNewGrpModal").onclick = closeModal;
-        $("cancelNewGrpBtn").onclick = closeModal;
-        $("newGrpAvatarPreview").onclick = () => $("newGrpAvatarInput").click();
-        $("newGrpAvatarInput").onchange = (e) => {
-          const file = e.target.files[0];
-          if (!file) return;
-          groupAvatarFile = file;
-          const reader = new FileReader();
-          reader.onload = () => {
-            $("newGrpImg").src = reader.result;
-            $("newGrpImg").classList.remove("hidden");
-            $("newGrpInitials").classList.add("hidden");
-          };
-          reader.readAsDataURL(file);
-        };
-
-        $("submitNewGrpBtn").onclick = async () => {
-          const name = $("newGrpName").value.trim();
+        $("closeGroupModal").onclick = closeModal;
+        $("cancelGroupBtn").onclick = closeModal;
+        $("createGroupSubmitBtn").onclick = async () => {
+          const name = $("newGroupName").value.trim();
+          const description = $("newGroupDesc").value.trim();
           if (!name) {
             showToast("נא להזין שם לקבוצה.");
             return;
           }
-          const btn = $("submitNewGrpBtn");
-          btn.disabled = true;
-          btn.textContent = "יוצר קבוצה...";
+          const selected = [...$("modalContent").querySelectorAll(".group-member-cb:checked")].map((cb) => cb.value);
+          const participants = [meId, ...selected];
 
-          const selectedIds = [...$("modalContent").querySelectorAll(".grp-member-cb:checked")].map((cb) => cb.value);
-          const participants = [meId, ...selectedIds];
-
-          let avatarUrl = null;
-          if (groupAvatarFile) {
-            try {
-              avatarUrl = await uploadMediaToCloud(groupAvatarFile, "groups", groupAvatarFile.name);
-            } catch (_) {}
-          }
-
-          const { data: createdChat, error } = await sb.from("chats").insert({
+          const { data: inserted, error } = await sb.from("chats").insert({
             type: "group",
             name,
-            description: $("newGrpDesc").value.trim(),
-            avatar_url: avatarUrl,
+            description,
             participants,
             admins: [meId]
           }).select().single();
 
           if (error) {
-            btn.disabled = false;
-            btn.textContent = "צור קבוצה";
             showToast("שגיאה ביצירת הקבוצה: " + error.message);
             return;
           }
 
-          const mappedChat = mapChatFromDB(createdChat);
-          state.chats[mappedChat.id] = mappedChat;
+          const mapped = mapChatFromDB(inserted);
+          state.chats[mapped.id] = mapped;
 
-          await sb.from("messages").insert({
-            chat_id: mappedChat.id,
-            sender_id: meId,
+          await sendMessage({
             type: "system",
-            text: `${state.users[meId]?.fullName || "מנהל"} יצר/ה את הקבוצה "${name}"`
+            text: `הקבוצה "${name}" נוצרה ע"י ${state.users[meId]?.fullName || "מנהל"}`,
+            targetChatId: mapped.id
           });
 
           closeModal();
           switchMainTab("chats");
-          openChat(mappedChat.id);
+          openChat(mapped.id);
           showToast(`הקבוצה "${name}" נוצרה בהצלחה!`);
         };
       }
 
-      /* ===================== GENERIC MODAL & LOGOUT ===================== */
+      function showAddMemberModal(chat) {
+        const candidates = Object.values(state.users).filter((u) => !chat.participants.includes(u.id) && !u.isBanned);
+        openModal(`
+          <div class="modal-header">
+            <span class="modal-title">הוספת משתתפים לקבוצה</span>
+            <button type="button" class="icon-btn" id="closeAddMemModal">✕</button>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:8px;max-height:280px;overflow-y:auto;">
+            ${candidates.length === 0
+              ? `<div style="font-size:13.5px;color:var(--text-muted);">כל המשתמשים הרשומים כבר נמצאים בקבוצה.</div>`
+              : candidates.map((u) => `
+                <button type="button" class="existing-user-item" data-add-uid="${u.id}">
+                  ${renderAvatarHTML(u, "sm", isUserVisiblyOnline(u))}
+                  <span style="flex:1;font-weight:600;">${escapeHtml(u.fullName)}</span>
+                  <span style="color:var(--accent);font-weight:700;">+ הוסף</span>
+                </button>
+              `).join("")}
+          </div>
+        `);
+        $("closeAddMemModal").onclick = closeModal;
+        $("modalContent").querySelectorAll("[data-add-uid]").forEach((btn) => {
+          btn.onclick = async () => {
+            const uid = btn.dataset.addUid;
+            chat.participants = [...new Set([...chat.participants, uid])];
+            await sb.from("chats").update({ participants: chat.participants }).eq("id", chat.id);
+            closeModal();
+            renderAll();
+            openChatInfoDrawer();
+            showToast(`${state.users[uid]?.fullName} נוסף לקבוצה.`);
+          };
+        });
+      }
+
+      /* ===================== MODAL HELPERS & LOGOUT ===================== */
       function openModal(innerHTML, transparentBox = false) {
         const box = $("modalContent");
-        box.innerHTML = innerHTML;
         box.style.background = transparentBox ? "transparent" : "var(--bg-modal)";
         box.style.boxShadow = transparentBox ? "none" : "var(--shadow-lg)";
+        box.innerHTML = innerHTML;
         $("modalBackdrop").classList.remove("hidden");
       }
 
       function closeModal() {
         $("modalBackdrop").classList.add("hidden");
+        $("modalContent").innerHTML = "";
       }
 
       async function logoutCurrentUser() {
         const me = state.users[state.currentUserId];
+        // Prevent blocked users from logging out under any circumstance
         if (me && me.isBanned && !state.isAdminMode) {
           enforceSystemLockAndBan();
           return;
         }
 
-        if (state.currentUserId && sb) {
-          await updateMyPresence(false);
-        }
+        await updateMyPresence(false);
         if (realtimeChannel && sb) {
           sb.removeChannel(realtimeChannel);
           realtimeChannel = null;
@@ -6044,14 +5988,15 @@
         state.messages = {};
         closeDrawer();
         closeModal();
-        enforceSystemLockAndBan();
         showAuthScreen(false);
+        enforceSystemLockAndBan();
       }
 
-      /* ===================== COMPOSER & EVENT WIRING ===================== */
+      /* ===================== COMPOSER & GLOBAL EVENT WIRING ===================== */
       function updateComposerButtonState() {
         const hasText = $("messageTextarea").value.trim().length > 0;
-        if (hasText || state.editingMsgId || mediaRecorder) {
+        const isRec = Boolean(mediaRecorder);
+        if (hasText || isRec) {
           $("micIconSvg").classList.add("hidden");
           $("sendIconSvg").classList.remove("hidden");
         } else {
@@ -6061,80 +6006,80 @@
       }
 
       function renderAll() {
-        if (!state.currentUserId) return;
-        enforceSystemLockAndBan();
         renderSidebar();
-        if (state.activeChatId) {
+        if (state.activeChatId && state.chats[state.activeChatId]) {
           renderActiveChat();
         }
       }
 
       function initAppEvents() {
-        // Lock overlay logout & admin login buttons
-        $("lockOverlayLogoutBtn").onclick = logoutCurrentUser;
-        $("lockOverlayAdminLoginBtn").onclick = () => {
-          state.bypassLockForLogin = true;
-          $("systemLockOverlay").classList.add("hidden");
-          showAuthScreen(false);
-        };
-
         document.querySelectorAll(".main-tab").forEach((tab) => {
-          tab.onclick = () => switchMainTab(tab.dataset.tab);
+          tab.addEventListener("click", () => switchMainTab(tab.dataset.tab));
         });
 
-        $("filterChips").onclick = (e) => {
+        $("globalSearchInput").addEventListener("input", (e) => {
+          state.searchQuery = e.target.value;
+          $("clearGlobalSearch").classList.toggle("hidden", !state.searchQuery);
+          renderSidebar();
+        });
+
+        $("clearGlobalSearch").addEventListener("click", () => {
+          state.searchQuery = "";
+          $("globalSearchInput").value = "";
+          $("clearGlobalSearch").classList.add("hidden");
+          renderSidebar();
+        });
+
+        $("filterChips").addEventListener("click", (e) => {
           const chip = e.target.closest(".chip");
           if (!chip) return;
           state.activeFilter = chip.dataset.filter;
           $("filterChips").querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
           chip.classList.add("active");
-          renderSidebar();
-        };
+          if (state.activeTab !== "chats") switchMainTab("chats");
+          else renderSidebar();
+        });
 
-        $("globalSearchInput").oninput = (e) => {
-          state.searchQuery = e.target.value;
-          $("clearGlobalSearch").classList.toggle("hidden", !state.searchQuery);
-          renderSidebar();
-        };
-
-        $("clearGlobalSearch").onclick = () => {
-          state.searchQuery = "";
-          $("globalSearchInput").value = "";
-          $("clearGlobalSearch").classList.add("hidden");
-          renderSidebar();
-        };
-
-        $("myProfileTrigger").onclick = openMyProfileDrawer;
-        $("btnOpenSettings").onclick = openSettingsDrawer;
-        $("btnStarredView").onclick = openStarredMessagesDrawer;
-        $("btnNewGroup").onclick = showCreateGroupModal;
-        $("btnSwitchAccount").onclick = logoutCurrentUser;
-        $("welcomeGoUsersBtn").onclick = () => switchMainTab("users");
-        $("welcomeSelfChatBtn").onclick = async () => {
+        $("myProfileTrigger").addEventListener("click", openMyProfileDrawer);
+        $("btnOpenSettings").addEventListener("click", openSettingsDrawer);
+        $("btnStarredView").addEventListener("click", openStarredMessagesDrawer);
+        $("btnNewGroup").addEventListener("click", showNewGroupModal);
+        $("btnSwitchAccount").addEventListener("click", logoutCurrentUser);
+        $("lockOverlayLogoutBtn").addEventListener("click", logoutCurrentUser);
+        $("lockOverlayAdminLoginBtn").addEventListener("click", () => {
+          state.bypassLockForLogin = true;
+          $("systemLockOverlay").classList.add("hidden");
+          showAuthScreen(false);
+        });
+        $("welcomeGoUsersBtn").addEventListener("click", () => switchMainTab("users"));
+        $("welcomeSelfChatBtn").addEventListener("click", async () => {
           const selfChat = await getOrCreateSelfChat();
           if (selfChat) openChat(selfChat.id);
-        };
+        });
+        $("closeDrawerBtn").addEventListener("click", closeDrawer);
 
-        $("btnChatBack").onclick = closeChatMobile;
-        $("chatHeaderInfo").onclick = openChatInfoDrawer;
-        $("btnOpenChatProfile").onclick = openChatInfoDrawer;
-        $("closeDrawerBtn").onclick = closeDrawer;
+        $("btnChatBack").addEventListener("click", closeChatMobile);
+        $("chatHeaderInfo").addEventListener("click", openChatInfoDrawer);
+        $("btnOpenChatProfile").addEventListener("click", openChatInfoDrawer);
 
-        $("btnTogglePinChat").onclick = async () => {
+        $("btnTogglePinChat").addEventListener("click", async () => {
           const chat = state.chats[state.activeChatId];
           const meId = state.currentUserId;
           if (!chat) return;
-          let nextPinned = [...(chat.pinnedBy || [])];
-          const idx = nextPinned.indexOf(meId);
-          if (idx >= 0) nextPinned.splice(idx, 1);
-          else nextPinned.push(meId);
-          chat.pinnedBy = nextPinned;
+          const set = new Set(chat.pinnedBy || []);
+          if (set.has(meId)) {
+            set.delete(meId);
+            showToast("הצמדת השיחה בוטלה.");
+          } else {
+            set.add(meId);
+            showToast("השיחה הוצמדה לראש הרשימה.");
+          }
+          chat.pinnedBy = [...set];
           renderSidebar();
-          showToast(idx >= 0 ? "בוטלה הצמדת השיחה." : "השיחה הוצמדה לראש הרשימה.");
-          await sb.from("chats").update({ pinned_by: nextPinned }).eq("id", chat.id);
-        };
+          await sb.from("chats").update({ pinned_by: chat.pinnedBy }).eq("id", chat.id);
+        });
 
-        $("btnToggleInChatSearch").onclick = () => {
+        $("btnToggleInChatSearch").addEventListener("click", () => {
           state.inChatSearchOpen = !state.inChatSearchOpen;
           $("inChatSearchBar").classList.toggle("hidden", !state.inChatSearchOpen);
           if (state.inChatSearchOpen) $("inChatSearchInput").focus();
@@ -6143,184 +6088,183 @@
             $("inChatSearchInput").value = "";
             renderActiveChat();
           }
-        };
+        });
 
-        $("inChatSearchInput").oninput = (e) => {
+        $("inChatSearchInput").addEventListener("input", (e) => {
           state.inChatQuery = e.target.value;
           renderActiveChat();
-        };
+        });
 
-        $("closeInChatSearch").onclick = () => {
+        $("closeInChatSearch").addEventListener("click", () => {
           state.inChatSearchOpen = false;
           state.inChatQuery = "";
           $("inChatSearchBar").classList.add("hidden");
-          $("inChatSearchInput").value = "";
           renderActiveChat();
-        };
+        });
 
-        $("pinnedMessageBanner").onclick = (e) => {
-          if (e.target.closest("#btnUnpinBannerMsg")) return;
+        $("pinnedMessageBanner").addEventListener("click", () => {
           const chat = state.chats[state.activeChatId];
           if (chat?.pinnedMessageId) {
-            const target = $("msg_" + chat.pinnedMessageId);
-            if (target) {
-              target.scrollIntoView({ behavior: "smooth", block: "center" });
-              target.classList.add("highlight");
-              setTimeout(() => target.classList.remove("highlight"), 1800);
+            const el = $("msg_" + chat.pinnedMessageId);
+            if (el) {
+              el.scrollIntoView({ behavior: "smooth", block: "center" });
+              el.classList.add("highlight");
+              setTimeout(() => el.classList.remove("highlight"), 1800);
             }
           }
-        };
+        });
 
-        $("btnUnpinBannerMsg").onclick = async () => {
+        $("btnUnpinBannerMsg").addEventListener("click", async (e) => {
+          e.stopPropagation();
           const chat = state.chats[state.activeChatId];
           if (chat) {
             chat.pinnedMessageId = null;
             renderActiveChat();
             await sb.from("chats").update({ pinned_message_id: null }).eq("id", chat.id);
           }
-        };
+        });
 
-        $("cancelReplyEditBtn").onclick = () => {
+        $("unblockFromBannerBtn").addEventListener("click", async () => {
+          const chat = state.chats[state.activeChatId];
+          const me = state.users[state.currentUserId];
+          if (!chat || !me) return;
+          const otherId = chat.participants.find((id) => id !== me.id);
+          me.blockedUsers = (me.blockedUsers || []).filter((id) => id !== otherId);
+          await sb.from("profiles").update({ blocked_users: me.blockedUsers }).eq("id", me.id);
+          renderActiveChat();
+          showToast("החסימה בוטלה.");
+        });
+
+        $("cancelReplyEditBtn").addEventListener("click", () => {
           state.replyToMsgId = null;
           state.editingMsgId = null;
           $("messageTextarea").value = "";
           updateComposerButtonState();
           renderActiveChat();
-        };
+        });
 
-        $("unblockFromBannerBtn").onclick = async () => {
-          const chat = state.chats[state.activeChatId];
-          const me = state.users[state.currentUserId];
-          if (!chat || !me) return;
-          const otherId = chat.participants.find((id) => id !== me.id);
-          const nextBlocked = (me.blockedUsers || []).filter((id) => id !== otherId);
-          me.blockedUsers = nextBlocked;
-          await sb.from("profiles").update({ blocked_users: nextBlocked }).eq("id", me.id);
-          renderActiveChat();
-          showToast("החסימה הוסרה.");
-        };
-
-        $("cancelMultiSelect").onclick = () => {
+        $("cancelMultiSelect").addEventListener("click", () => {
           state.multiSelectMode = false;
           state.selectedMsgIds.clear();
           renderActiveChat();
-        };
+        });
 
-        $("deleteSelectedBtn").onclick = async () => {
+        $("deleteSelectedBtn").addEventListener("click", async () => {
           if (state.selectedMsgIds.size === 0) return;
-          await deleteMessageForMe([...state.selectedMsgIds]);
+          const ids = [...state.selectedMsgIds];
           state.multiSelectMode = false;
           state.selectedMsgIds.clear();
-          renderActiveChat();
-          showToast("ההודעות הנבחרות נמחקו.");
-        };
-
-        const msgContainer = $("messagesContainer");
-        msgContainer.onscroll = () => {
-          const distFromBottom = msgContainer.scrollHeight - msgContainer.scrollTop - msgContainer.clientHeight;
-          $("scrollBottomBtn").classList.toggle("hidden", distFromBottom < 180);
-        };
-        $("scrollBottomBtn").onclick = () => {
-          msgContainer.scrollTop = msgContainer.scrollHeight;
-        };
-
-        $("emojiGrid").innerHTML = EMOJIS.map((em) => `<button type="button" class="emoji-btn">${em}</button>`).join("");
-        $("emojiGrid").onclick = (e) => {
-          const btn = e.target.closest(".emoji-btn");
-          if (!btn) return;
-          const ta = $("messageTextarea");
-          ta.value += btn.textContent;
-          ta.focus();
-          updateComposerButtonState();
-        };
-
-        $("btnEmojiToggle").onclick = (e) => {
-          e.stopPropagation();
-          $("attachPopover").classList.add("hidden");
-          $("emojiPickerPopover").classList.toggle("hidden");
-        };
-
-        $("btnAttachToggle").onclick = (e) => {
-          e.stopPropagation();
-          $("emojiPickerPopover").classList.add("hidden");
-          $("attachPopover").classList.toggle("hidden");
-        };
-
-        $("btnAttachImage").onclick = () => {
-          $("attachPopover").classList.add("hidden");
-          $("imageFileInput").click();
-        };
-
-        $("btnAttachFile").onclick = () => {
-          $("attachPopover").classList.add("hidden");
-          $("docFileInput").click();
-        };
-
-        $("btnCreatePoll").onclick = () => {
-          $("attachPopover").classList.add("hidden");
-          showCreatePollModal();
-        };
-
-        $("imageFileInput").onchange = (e) => {
-          handleFileUpload(e.target.files[0], "image");
-          e.target.value = "";
-        };
-
-        $("docFileInput").onchange = (e) => {
-          handleFileUpload(e.target.files[0], "file");
-          e.target.value = "";
-        };
+          await deleteMessageForMe(ids);
+          showToast(`${ids.length} הודעות נמחקו.`);
+        });
 
         const textarea = $("messageTextarea");
-        textarea.oninput = () => {
+        textarea.addEventListener("input", () => {
           textarea.style.height = "auto";
           textarea.style.height = Math.min(textarea.scrollHeight, 120) + "px";
           updateComposerButtonState();
           handleMentionAutocomplete();
+
           if (textarea.value.trim().length > 0) {
             setTypingState("typing");
             clearTimeout(typingTimeout);
-            typingTimeout = setTimeout(() => setTypingState(null), 2600);
+            typingTimeout = setTimeout(() => setTypingState(null), 2400);
           } else {
             setTypingState(null);
           }
-        };
+        });
 
-        textarea.onkeydown = async (e) => {
+        textarea.addEventListener("keydown", async (e) => {
           if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
-            const txt = textarea.value.trim();
-            if (txt) {
+            const val = textarea.value.trim();
+            if (val) {
               textarea.value = "";
               textarea.style.height = "auto";
               $("mentionPopover").classList.add("hidden");
               updateComposerButtonState();
-              await sendMessage({ type: "text", text: txt });
+              await sendMessage({ type: "text", text: val });
             }
           }
-        };
+        });
 
-        $("btnSendOrMic").onclick = async () => {
+        $("btnSendOrMic").addEventListener("click", async () => {
           if (mediaRecorder) {
             stopVoiceRecording(true);
             return;
           }
-          const txt = textarea.value.trim();
-          if (txt) {
+          const val = textarea.value.trim();
+          if (val) {
             textarea.value = "";
             textarea.style.height = "auto";
             $("mentionPopover").classList.add("hidden");
             updateComposerButtonState();
-            await sendMessage({ type: "text", text: txt });
+            await sendMessage({ type: "text", text: val });
           } else {
             startVoiceRecording();
           }
-        };
+        });
 
-        $("cancelRecordingBtn").onclick = () => stopVoiceRecording(false);
+        $("cancelRecordingBtn").addEventListener("click", () => stopVoiceRecording(false));
+
+        $("emojiGrid").innerHTML = EMOJIS.map((e) => `<button type="button" class="emoji-btn">${e}</button>`).join("");
+        $("btnEmojiToggle").addEventListener("click", (e) => {
+          e.stopPropagation();
+          $("attachPopover").classList.add("hidden");
+          $("emojiPickerPopover").classList.toggle("hidden");
+        });
+
+        $("emojiGrid").addEventListener("click", (e) => {
+          const btn = e.target.closest(".emoji-btn");
+          if (!btn) return;
+          textarea.value += btn.textContent;
+          textarea.focus();
+          updateComposerButtonState();
+        });
+
+        $("btnAttachToggle").addEventListener("click", (e) => {
+          e.stopPropagation();
+          $("emojiPickerPopover").classList.add("hidden");
+          $("attachPopover").classList.toggle("hidden");
+        });
+
+        $("btnAttachImage").addEventListener("click", () => {
+          $("attachPopover").classList.add("hidden");
+          $("imageFileInput").click();
+        });
+
+        $("btnAttachFile").addEventListener("click", () => {
+          $("attachPopover").classList.add("hidden");
+          $("docFileInput").click();
+        });
+
+        $("btnCreatePoll").addEventListener("click", () => {
+          $("attachPopover").classList.add("hidden");
+          showCreatePollModal();
+        });
+
+        $("imageFileInput").addEventListener("change", (e) => {
+          handleFileUpload(e.target.files[0], "image");
+          e.target.value = "";
+        });
+
+        $("docFileInput").addEventListener("change", (e) => {
+          handleFileUpload(e.target.files[0], "file");
+          e.target.value = "";
+        });
+
+        const msgContainer = $("messagesContainer");
+        msgContainer.addEventListener("scroll", () => {
+          const distFromBottom = msgContainer.scrollHeight - msgContainer.scrollTop - msgContainer.clientHeight;
+          $("scrollBottomBtn").classList.toggle("hidden", distFromBottom < 180);
+        });
+
+        $("scrollBottomBtn").addEventListener("click", () => {
+          msgContainer.scrollTop = msgContainer.scrollHeight;
+        });
 
         document.addEventListener("click", (e) => {
-          if (!e.target.closest("#msgContextMenu") && !e.target.closest(".msg-menu-trigger")) {
+          if (!e.target.closest("#msgContextMenu") && !e.target.closest("[data-open-menu]")) {
             closeContextMenu();
           }
           if (!e.target.closest("#emojiPickerPopover") && !e.target.closest("#btnEmojiToggle")) {
@@ -6329,14 +6273,25 @@
           if (!e.target.closest("#attachPopover") && !e.target.closest("#btnAttachToggle")) {
             $("attachPopover").classList.add("hidden");
           }
-          if (!e.target.closest("#mentionPopover") && !e.target.closest("#messageTextarea")) {
+          if (!e.target.closest("#mentionPopover")) {
             $("mentionPopover").classList.add("hidden");
           }
         });
 
-        $("modalBackdrop").onclick = (e) => {
+        $("modalBackdrop").addEventListener("click", (e) => {
           if (e.target === $("modalBackdrop")) closeModal();
-        };
+        });
+
+        document.addEventListener("visibilitychange", async () => {
+          if (!state.currentUserId) return;
+          if (document.hidden) {
+            await updateMyPresence(false);
+          } else {
+            await updateMyPresence(true);
+            await markMessagesDeliveredAndRead();
+            renderAll();
+          }
+        });
 
         window.addEventListener("beforeunload", () => {
           if (state.currentUserId && sb) {
@@ -6347,29 +6302,36 @@
           }
         });
 
-        document.addEventListener("visibilitychange", () => {
-          if (state.currentUserId && sb) {
-            updateMyPresence(!document.hidden);
-            if (!document.hidden) markMessagesDeliveredAndRead();
+        // Heartbeat every 15 seconds for accurate presence & typing expiry
+        setInterval(async () => {
+          if (!state.currentUserId) return;
+          if (!document.hidden) {
+            await updateMyPresence(true);
           }
-        });
-
-        setInterval(() => {
-          if (state.currentUserId && !document.hidden && sb) {
-            updateMyPresence(true);
-            renderSidebar();
-          }
-        }, 25000);
+          renderSidebar();
+          if (state.activeChatId) renderActiveChat();
+        }, 15000);
       }
 
-      /* ===================== BOOTSTRAP APPLICATION ===================== */
+      /* ===================== BOOTSTRAP & SESSION RESTORE ===================== */
       async function bootstrap() {
+        // Hard failsafe so loadingScreen can never spin forever
+        const failsafeTimer = setTimeout(() => {
+          if (!$("loadingScreen").classList.contains("hidden")) {
+            $("loadingScreen").classList.add("hidden");
+            if (!state.currentUserId) {
+              showAuthScreen(false);
+            }
+          }
+        }, 4500);
+
         loadLocalUISettings();
         applySettingsToDOM();
         initAuthUI();
         initAppEvents();
 
         if (!sb) {
+          clearTimeout(failsafeTimer);
           showAuthScreen(false);
           $("loginError").textContent = "לא הצלחנו לטעון את ספריית החיבור לענן. בדוק חיבור אינטרנט ורענן.";
           $("loginError").classList.remove("hidden");
@@ -6377,6 +6339,27 @@
         }
 
         try {
-          await fetchGlobalAppSettings();
+          fetchGlobalAppSettings().catch(() => {});
 
-          const { data } = await withTimeout(sb.auth.getSession(), 450
+          const { data } = await withTimeout(sb.auth.getSession(), 3200);
+          const session = data?.session || null;
+
+          if (session && session.user) {
+            await completeLoginFlow(session.user.id, session.user);
+          } else {
+            showAuthScreen(false);
+          }
+        } catch (err) {
+          console.warn("Session restore fallback:", err);
+          showAuthScreen(false);
+        } finally {
+          clearTimeout(failsafeTimer);
+          $("loadingScreen").classList.add("hidden");
+        }
+      }
+
+      bootstrap();
+    })();
+  </script>
+</body>
+</html>
