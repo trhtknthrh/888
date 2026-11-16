@@ -5,6 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>WhatsApp Web</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    if (!window.supabase) {
+      document.write('<script src="https://unpkg.com/@supabase/supabase-js@2"><\/script>');
+    }
+  </script>
   <style>
     :root {
       --bg-app: #efeae2;
@@ -2122,12 +2127,16 @@
       const SYNTHETIC_EMAIL_DOMAIN = "wachat-app.com";
       const ADMIN_SECRET_CODE = "/מנהל26117";
 
-      const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
-        auth: {
-          persistSession: true,
-          autoRefreshToken: true
-        }
-      });
+      const sb = window.supabase
+        ? window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+            auth: {
+              persistSession: true,
+              autoRefreshToken: true,
+              detectSessionInUrl: false,
+              lock: async (_name, _acquireTimeout, fn) => await fn()
+            }
+          })
+        : null;
 
       /* ===================== CONSTANTS & UTILITIES ===================== */
       const LOCAL_SETTINGS_KEY = "wa_cloud_ui_settings_v1";
@@ -2145,6 +2154,13 @@
       const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 
       const $ = (id) => document.getElementById(id);
+
+      function withTimeout(promise, ms = 4500) {
+        return Promise.race([
+          promise,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("TIMEOUT")), ms))
+        ]);
+      }
 
       function usernameToEmail(username) {
         const clean = username.trim().replace(/^@+/, "").toLowerCase();
@@ -2478,8 +2494,12 @@
 
       /* ===================== CLOUD SYNC & REALTIME SUBSCRIPTIONS ===================== */
       async function fetchGlobalAppSettings() {
+        if (!sb) return;
         try {
-          const { data } = await sb.from("app_settings").select("*").eq("id", 1).maybeSingle();
+          const { data } = await withTimeout(
+            sb.from("app_settings").select("*").eq("id", 1).maybeSingle(),
+            3500
+          );
           if (data) {
             state.globalSiteLocked = Boolean(data.global_lock);
             enforceSystemLockAndBan();
@@ -2487,9 +2507,32 @@
         } catch (_) {}
       }
 
+      async function ensureCurrentUserProfile(userId, authUser = null) {
+        if (state.users[userId]) return;
+        const emailPrefix = (authUser?.email || "user").split("@")[0];
+        const fallbackName = authUser?.user_metadata?.full_name || emailPrefix;
+        const fallbackUser = authUser?.user_metadata?.username || emailPrefix;
+
+        const { data: upserted } = await sb
+          .from("profiles")
+          .upsert({
+            id: userId,
+            full_name: fallbackName,
+            username: fallbackUser,
+            is_online: true,
+            last_seen: new Date().toISOString()
+          })
+          .select()
+          .maybeSingle();
+
+        if (upserted) {
+          state.users[userId] = mapProfileFromDB(upserted);
+        }
+      }
+
       async function fetchAllCloudData() {
         const meId = state.currentUserId;
-        if (!meId) return;
+        if (!meId || !sb) return;
 
         await fetchGlobalAppSettings();
 
@@ -2538,6 +2581,7 @@
       }
 
       function setupRealtimeSubscriptions() {
+        if (!sb) return;
         if (realtimeChannel) {
           sb.removeChannel(realtimeChannel);
           realtimeChannel = null;
@@ -2691,7 +2735,7 @@
 
       async function updateMyPresence(isOnline = true) {
         const me = state.users[state.currentUserId];
-        if (!me) return;
+        if (!me || !sb) return;
         const nowIso = new Date().toISOString();
         me.isOnline = isOnline;
         me.lastSeen = Date.now();
@@ -2712,7 +2756,7 @@
 
       async function markMessagesDeliveredAndRead() {
         const me = state.users[state.currentUserId];
-        if (!me) return;
+        if (!me || !sb) return;
         const now = Date.now();
         const updates = [];
 
@@ -2839,6 +2883,12 @@
           const btn = $("loginSubmitBtn");
           errEl.classList.add("hidden");
 
+          if (!sb) {
+            errEl.textContent = "שגיאת חיבור לשרת. רענן את העמוד.";
+            errEl.classList.remove("hidden");
+            return;
+          }
+
           const username = $("loginUsername").value.trim().replace(/^@+/, "").toLowerCase();
           const password = $("loginPassword").value;
 
@@ -2866,7 +2916,7 @@
 
             if (data?.user) {
               requestBrowserNotificationPermission();
-              await completeLoginFlow(data.user.id);
+              await completeLoginFlow(data.user.id, data.user);
             }
           } catch (err) {
             errEl.textContent = err.message || "שגיאה בהתחברות.";
@@ -2883,6 +2933,12 @@
           const errEl = $("regError");
           const btn = $("regSubmitBtn");
           errEl.classList.add("hidden");
+
+          if (!sb) {
+            errEl.textContent = "שגיאת חיבור לשרת. רענן את העמוד.";
+            errEl.classList.remove("hidden");
+            return;
+          }
 
           const fullName = $("regFullName").value.trim();
           const username = $("regUsername").value.trim().replace(/^@+/, "").toLowerCase();
@@ -2959,7 +3015,7 @@
             }
 
             requestBrowserNotificationPermission();
-            await completeLoginFlow(newUserId);
+            await completeLoginFlow(newUserId, data.user);
             showToast(`ברוך הבא, ${fullName}! החשבון נשמר בענן.`);
           } catch (err) {
             errEl.textContent = err.message || "שגיאה ביצירת משתמש.";
@@ -2992,15 +3048,16 @@
         }
       }
 
-      async function completeLoginFlow(userId) {
+      async function completeLoginFlow(userId, authUser = null) {
         state.currentUserId = userId;
         state.activeChatId = null;
 
-        await fetchAllCloudData();
+        await withTimeout(fetchAllCloudData(), 6000);
+        await ensureCurrentUserProfile(userId, authUser);
         await getOrCreateSelfChat();
         setupRealtimeSubscriptions();
-        await updateMyPresence(true);
-        await markMessagesDeliveredAndRead();
+        updateMyPresence(true);
+        markMessagesDeliveredAndRead();
 
         $("loadingScreen").classList.add("hidden");
         $("authScreen").classList.add("hidden");
@@ -3015,7 +3072,7 @@
 
       async function getOrCreateSelfChat() {
         const meId = state.currentUserId;
-        if (!meId) return null;
+        if (!meId || !sb) return null;
         const existingLocal = Object.values(state.chats).find((c) => isSelfChat(c));
         if (existingLocal) return existingLocal;
 
@@ -3026,9 +3083,9 @@
             participants: [meId]
           })
           .select()
-          .single();
+          .maybeSingle();
 
-        if (error) return null;
+        if (error || !inserted) return null;
         const mapped = mapChatFromDB(inserted);
         state.chats[mapped.id] = mapped;
         return mapped;
@@ -3477,7 +3534,6 @@
                    (u.bio || "").toLowerCase().includes(q);
           });
 
-          // Always show "Chat with yourself" at the top of Users tab
           if (me && (!q || "עצמך".includes(q) || "שמורות".includes(q) || me.fullName.toLowerCase().includes(q))) {
             html += `<div class="list-section-title">אזור אישי</div>`;
             html += `
@@ -3800,7 +3856,6 @@
           $("inChatSearchCount").textContent = "";
         }
 
-        // Merge admin console logs chronologically if inside self-chat
         let timelineItems = msgs.map((m) => ({ kind: "msg", ts: m.createdAt, data: m }));
         if (selfChat && state.adminConsoleLogs.length > 0 && !searchQ) {
           state.adminConsoleLogs.forEach((log) => {
@@ -4153,7 +4208,6 @@
         const meId = state.currentUserId;
         if (!chat || !meId) return;
 
-        // Check for secret admin activation or admin commands in self-chat
         if (type === "text" && isSelfChat(chat) && !forwarded && !state.editingMsgId) {
           const handledAdmin = await handleAdminSelfChatCommand(text);
           if (handledAdmin) return;
@@ -4918,7 +4972,6 @@
           img.onclick = () => window.open(img.dataset.drawerImg, "_blank");
         });
 
-        // Change group photo
         const changePhotoBtn = $("btnChangeGroupPhoto");
         if (changePhotoBtn) {
           changePhotoBtn.onclick = () => $("grpChangeAvatarInput").click();
@@ -4941,7 +4994,6 @@
           };
         }
 
-        // Remove group photo
         const removePhotoBtn = $("btnRemoveGroupPhoto");
         if (removePhotoBtn) {
           removePhotoBtn.onclick = async () => {
@@ -4955,7 +5007,6 @@
           };
         }
 
-        // Mute group toggle
         $("toggleMuteGroup").onchange = async (e) => {
           const mutedBy = [...(chat.mutedBy || [])];
           const idx = mutedBy.indexOf(meId);
@@ -4966,7 +5017,6 @@
           await sb.from("chats").update({ muted_by: mutedBy }).eq("id", chatId);
         };
 
-        // Admins-only send toggle
         const adminsOnlyToggle = $("toggleAdminsOnlySend");
         if (adminsOnlyToggle) {
           adminsOnlyToggle.onchange = async (e) => {
@@ -4986,7 +5036,6 @@
           el.onclick = () => openUserProfileDrawer(el.dataset.viewMember);
         });
 
-        // Promote / Demote Admin
         $("drawerBody").querySelectorAll("[data-toggle-admin]").forEach((btn) => {
           btn.onclick = async () => {
             const targetId = btn.dataset.toggleAdmin;
@@ -5009,7 +5058,6 @@
           };
         });
 
-        // Remove member
         $("drawerBody").querySelectorAll("[data-remove-member]").forEach((btn) => {
           btn.onclick = async () => {
             const targetId = btn.dataset.removeMember;
@@ -5030,7 +5078,6 @@
         const addBtn = $("btnAddGroupMembers");
         if (addBtn) addBtn.onclick = () => showAddGroupMembersModal(chat);
 
-        // Leave Group (Fixed: deletes group if last member, promotes another admin if needed, and properly removes leaving user)
         $("btnLeaveGroup").onclick = () => {
           const isLastMember = chat.participants.length <= 1;
 
@@ -5494,97 +5541,131 @@
             <span class="modal-title">הוספת משתתפים לקבוצה</span>
             <button type="button" class="icon-btn" id="closeAddMemModal">✕</button>
           </div>
-          <div style="max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;">
+          <div style="display:flex;flex-direction:column;gap:8px;max-height:300px;overflow-y:auto;">
             ${candidates.length === 0
-              ? `<div style="font-size:13.5px;color:var(--text-muted);">כל המשתמשים הרשומים כבר חברים בקבוצה זו.</div>`
+              ? `<div style="font-size:13.5px;color:var(--text-muted);">כל המשתמשים הרשומים כבר נמצאים בקבוצה זו.</div>`
               : candidates.map((u) => `
-                <label class="existing-user-item" style="cursor:pointer;">
-                  <input type="checkbox" value="${u.id}" class="add-mem-cb" style="width:18px;height:18px;accent-color:var(--accent);" />
+                <button type="button" class="existing-user-item" data-add-uid="${u.id}">
                   ${renderAvatarHTML(u, "sm", isUserVisiblyOnline(u))}
                   <span style="flex:1;font-weight:600;">${escapeHtml(u.fullName)}</span>
-                </label>
+                  <span style="color:var(--accent);font-weight:700;">+ הוסף</span>
+                </button>
               `).join("")
             }
           </div>
-          <div class="modal-actions">
-            <button type="button" class="btn-secondary" id="cancelAddMemBtn">סגור</button>
-            ${candidates.length > 0 ? `<button type="button" class="btn-primary" id="confirmAddMemBtn" style="width:auto;">הוסף לקבוצה</button>` : ""}
-          </div>
         `);
         $("closeAddMemModal").onclick = closeModal;
-        $("cancelAddMemBtn").onclick = closeModal;
-        const confirmBtn = $("confirmAddMemBtn");
-        if (confirmBtn) {
-          confirmBtn.onclick = async () => {
-            const addedIds = [...$("modalContent").querySelectorAll(".add-mem-cb:checked")].map((cb) => cb.value);
-            if (addedIds.length > 0) {
-              chat.participants = [...new Set([...chat.participants, ...addedIds])];
-              await sb.from("chats").update({ participants: chat.participants }).eq("id", chat.id);
-              const addedNames = addedIds.map((id) => state.users[id]?.fullName || "משתמש").join(", ");
-              await addSystemMessage(chat.id, `${addedNames} צורף/ה לקבוצה.`);
-            }
+        $("modalContent").querySelectorAll("[data-add-uid]").forEach((btn) => {
+          btn.onclick = async () => {
+            const uidToAdd = btn.dataset.addUid;
+            const addedUser = state.users[uidToAdd];
+            chat.participants = [...new Set([...chat.participants, uidToAdd])];
+            await sb.from("chats").update({ participants: chat.participants }).eq("id", chat.id);
+            await addSystemMessage(chat.id, `${addedUser?.fullName || "משתמש"} צורף/ה לקבוצה.`);
             closeModal();
             openGroupInfoDrawer(chat.id);
             renderAll();
+            showToast(`${addedUser?.fullName || "משתמש"} נוסף לקבוצה.`);
           };
-        }
+        });
       }
 
       /* ===================== GENERIC MODAL HELPERS ===================== */
       function openModal(innerHTML, transparentBox = false) {
         const box = $("modalContent");
+        box.innerHTML = innerHTML;
         box.style.background = transparentBox ? "transparent" : "var(--bg-modal)";
         box.style.boxShadow = transparentBox ? "none" : "var(--shadow-lg)";
-        box.innerHTML = innerHTML;
         $("modalBackdrop").classList.remove("hidden");
       }
 
       function closeModal() {
         $("modalBackdrop").classList.add("hidden");
-        $("modalContent").innerHTML = "";
       }
 
-      /* ===================== LOGOUT FLOW ===================== */
       async function logoutCurrentUser() {
         await updateMyPresence(false);
-        if (realtimeChannel) {
+        if (realtimeChannel && sb) {
           sb.removeChannel(realtimeChannel);
           realtimeChannel = null;
         }
-        await sb.auth.signOut();
+        if (sb) await sb.auth.signOut();
         state.currentUserId = null;
+        state.activeChatId = null;
         state.isAdminMode = false;
         state.adminConsoleLogs = [];
-        state.activeChatId = null;
+        state.chats = {};
+        state.messages = {};
         closeRightDrawer();
         enforceSystemLockAndBan();
         showAuthScreen(false);
+        showToast("התנתקת מהחשבון.");
       }
 
-      /* ===================== GLOBAL RENDER & EVENT WIRING ===================== */
-      function renderAll() {
-        if (!state.currentUserId) return;
-        renderSidebar();
-        if (state.activeChatId) renderActiveChat();
+      /* ===================== GROUP @MENTIONS AUTOCOMPLETE ===================== */
+      function checkGroupMentionsPopover() {
+        const chat = state.chats[state.activeChatId];
+        const popover = $("mentionPopover");
+        if (!chat || chat.type !== "group") {
+          popover.classList.add("hidden");
+          return;
+        }
+        const ta = $("messageTextarea");
+        const val = ta.value;
+        const match = val.match(/(?:^|\s)@([a-zA-Z0-9._-]*)$/);
+        if (!match) {
+          popover.classList.add("hidden");
+          return;
+        }
+
+        const q = match[1].toLowerCase();
+        const members = chat.participants
+          .filter((id) => id !== state.currentUserId)
+          .map((id) => state.users[id])
+          .filter((u) => u && (u.username.toLowerCase().includes(q) || u.fullName.toLowerCase().includes(q)));
+
+        if (members.length === 0) {
+          popover.classList.add("hidden");
+          return;
+        }
+
+        $("mentionList").innerHTML = members.map((u) => `
+          <button type="button" class="attach-menu-item" data-pick-mention="${escapeHtml(u.username)}">
+            ${renderAvatarHTML(u, "sm", isUserVisiblyOnline(u))}
+            <div>
+              <div style="font-size:13.5px;font-weight:700;">${escapeHtml(u.fullName)}</div>
+              <div style="font-size:11.5px;color:var(--text-muted);" dir="ltr">@${escapeHtml(u.username)}</div>
+            </div>
+          </button>
+        `).join("");
+
+        popover.classList.remove("hidden");
+
+        $("mentionList").querySelectorAll("[data-pick-mention]").forEach((btn) => {
+          btn.onclick = () => {
+            const uname = btn.dataset.pickMention;
+            ta.value = ta.value.replace(/(^|\s)@[a-zA-Z0-9._-]*$/, `$1@${uname} `);
+            popover.classList.add("hidden");
+            ta.focus();
+            updateComposerButtonState();
+          };
+        });
       }
 
+      /* ===================== GLOBAL UI EVENT WIRING ===================== */
       function bindGlobalEvents() {
-        // Tabs: Chats / Users
+        $("lockOverlayLogoutBtn").addEventListener("click", () => logoutCurrentUser());
+
         document.querySelectorAll(".main-tab").forEach((tab) => {
           tab.addEventListener("click", () => switchMainTab(tab.dataset.tab));
         });
 
-        // Filter chips
-        $("filterChips").addEventListener("click", (e) => {
-          const chip = e.target.closest(".chip");
-          if (!chip) return;
-          state.activeFilter = chip.dataset.filter;
-          $("filterChips").querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
-          chip.classList.add("active");
-          switchMainTab("chats");
+        $("welcomeGoUsersBtn").addEventListener("click", () => switchMainTab("users"));
+        $("welcomeSelfChatBtn").addEventListener("click", async () => {
+          const selfChat = await getOrCreateSelfChat();
+          if (selfChat) openChat(selfChat.id);
         });
 
-        // Global search
         $("globalSearchInput").addEventListener("input", (e) => {
           state.searchQuery = e.target.value;
           $("clearGlobalSearch").classList.toggle("hidden", !state.searchQuery);
@@ -5598,32 +5679,30 @@
           renderSidebar();
         });
 
-        // Welcome screen buttons
-        $("welcomeGoUsersBtn").addEventListener("click", () => switchMainTab("users"));
-        $("welcomeSelfChatBtn").addEventListener("click", async () => {
-          const selfChat = await getOrCreateSelfChat();
-          if (selfChat) openChat(selfChat.id);
+        $("filterChips").addEventListener("click", (e) => {
+          const chip = e.target.closest(".chip");
+          if (!chip) return;
+          state.activeFilter = chip.dataset.filter;
+          $("filterChips").querySelectorAll(".chip").forEach((c) => c.classList.remove("active"));
+          chip.classList.add("active");
+          switchMainTab("chats");
         });
 
-        // Sidebar Header Buttons
         $("myProfileTrigger").addEventListener("click", () => openUserProfileDrawer(state.currentUserId));
-        $("btnOpenSettings").addEventListener("click", () => openSettingsDrawer());
-        $("btnStarredView").addEventListener("click", () => openStarredMessagesDrawer());
         $("btnNewGroup").addEventListener("click", () => showNewGroupModal());
+        $("btnStarredView").addEventListener("click", () => openStarredMessagesDrawer());
+        $("btnOpenSettings").addEventListener("click", () => openSettingsDrawer());
         $("btnSwitchAccount").addEventListener("click", () => logoutCurrentUser());
-        $("lockOverlayLogoutBtn").addEventListener("click", () => logoutCurrentUser());
 
-        // Chat Header Buttons
         $("btnChatBack").addEventListener("click", () => closeChatMobile());
 
         $("chatHeaderInfo").addEventListener("click", () => {
           const chat = state.chats[state.activeChatId];
           if (!chat) return;
           if (chat.type === "group") openGroupInfoDrawer(chat.id);
-          else if (isSelfChat(chat)) openUserProfileDrawer(state.currentUserId);
           else {
-            const otherId = chat.participants.find((id) => id !== state.currentUserId);
-            if (otherId) openUserProfileDrawer(otherId);
+            const meta = getChatDisplayMeta(chat);
+            if (meta.otherUser) openUserProfileDrawer(meta.otherUser.id);
           }
         });
 
@@ -5643,16 +5722,24 @@
           await sb.from("chats").update({ pinned_by: pinnedBy }).eq("id", chat.id);
         });
 
-        // In-Chat Search
         $("btnToggleInChatSearch").addEventListener("click", () => {
           state.inChatSearchOpen = !state.inChatSearchOpen;
           $("inChatSearchBar").classList.toggle("hidden", !state.inChatSearchOpen);
-          if (state.inChatSearchOpen) $("inChatSearchInput").focus();
-          else {
+          if (state.inChatSearchOpen) {
+            $("inChatSearchInput").focus();
+          } else {
             state.inChatQuery = "";
             $("inChatSearchInput").value = "";
             renderActiveChat();
           }
+        });
+
+        $("closeInChatSearch").addEventListener("click", () => {
+          state.inChatSearchOpen = false;
+          state.inChatQuery = "";
+          $("inChatSearchBar").classList.add("hidden");
+          $("inChatSearchInput").value = "";
+          renderActiveChat();
         });
 
         $("inChatSearchInput").addEventListener("input", (e) => {
@@ -5660,19 +5747,10 @@
           renderActiveChat();
         });
 
-        $("closeInChatSearch").addEventListener("click", () => {
-          state.inChatSearchOpen = false;
-          state.inChatQuery = "";
-          $("inChatSearchInput").value = "";
-          $("inChatSearchBar").classList.add("hidden");
-          renderActiveChat();
-        });
-
-        // Pinned Banner Click & Unpin
         $("pinnedMessageBanner").addEventListener("click", (e) => {
           if (e.target.closest("#btnUnpinBannerMsg")) return;
           const chat = state.chats[state.activeChatId];
-          if (chat && chat.pinnedMessageId) {
+          if (chat?.pinnedMessageId) {
             const el = $("msg_" + chat.pinnedMessageId);
             if (el) {
               el.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -5691,45 +5769,6 @@
           }
         });
 
-        // Unblock banner button
-        $("unblockFromBannerBtn").addEventListener("click", async () => {
-          const chat = state.chats[state.activeChatId];
-          const me = state.users[state.currentUserId];
-          if (!chat || !me) return;
-          const otherId = chat.participants.find((id) => id !== me.id);
-          me.blockedUsers = (me.blockedUsers || []).filter((id) => id !== otherId);
-          renderActiveChat();
-          showToast("החסימה בוטלה.");
-          await sb.from("profiles").update({ blocked_users: me.blockedUsers }).eq("id", me.id);
-        });
-
-        // Multi-select bar
-        $("cancelMultiSelect").addEventListener("click", () => {
-          state.multiSelectMode = false;
-          state.selectedMsgIds.clear();
-          renderActiveChat();
-        });
-
-        $("deleteSelectedBtn").addEventListener("click", async () => {
-          const ids = [...state.selectedMsgIds];
-          if (ids.length === 0) return;
-          await deleteMessageForMe(ids);
-          state.multiSelectMode = false;
-          state.selectedMsgIds.clear();
-          renderActiveChat();
-          showToast(`${ids.length} הודעות נמחקו אצלך.`);
-        });
-
-        // Cancel Reply / Edit
-        $("cancelReplyEditBtn").addEventListener("click", () => {
-          state.replyToMsgId = null;
-          state.editingMsgId = null;
-          $("messageTextarea").value = "";
-          updateComposerButtonState();
-          renderActiveChat();
-        });
-
-        // Scroll to bottom button
         $("messagesContainer").addEventListener("scroll", () => {
           const c = $("messagesContainer");
           const distFromBottom = c.scrollHeight - c.scrollTop - c.clientHeight;
@@ -5741,29 +5780,110 @@
           c.scrollTop = c.scrollHeight;
         });
 
-        // Emoji Picker
-        $("emojiGrid").innerHTML = EMOJIS.map((em) => `<button type="button" class="emoji-btn" data-pick-emoji="${em}">${em}</button>`).join("");
-        $("btnEmojiToggle").addEventListener("click", (e) => {
-          e.stopPropagation();
-          $("attachPopover").classList.add("hidden");
-          $("mentionPopover").classList.add("hidden");
-          $("emojiPickerPopover").classList.toggle("hidden");
+        $("cancelMultiSelect").addEventListener("click", () => {
+          state.multiSelectMode = false;
+          state.selectedMsgIds.clear();
+          renderActiveChat();
         });
 
+        $("deleteSelectedBtn").addEventListener("click", async () => {
+          if (state.selectedMsgIds.size === 0) return;
+          const count = state.selectedMsgIds.size;
+          const ids = [...state.selectedMsgIds];
+          state.multiSelectMode = false;
+          state.selectedMsgIds.clear();
+          await deleteMessageForMe(ids);
+          showToast(`${count} הודעות נמחקו אצלך.`);
+        });
+
+        $("cancelReplyEditBtn").addEventListener("click", () => {
+          state.replyToMsgId = null;
+          state.editingMsgId = null;
+          $("messageTextarea").value = "";
+          updateComposerButtonState();
+          renderActiveChat();
+        });
+
+        $("unblockFromBannerBtn").addEventListener("click", async () => {
+          const chat = state.chats[state.activeChatId];
+          const meta = chat ? getChatDisplayMeta(chat) : null;
+          const me = state.users[state.currentUserId];
+          if (meta?.otherUser && me) {
+            me.blockedUsers = (me.blockedUsers || []).filter((id) => id !== meta.otherUser.id);
+            renderActiveChat();
+            showToast("החסימה בוטלה.");
+            await sb.from("profiles").update({ blocked_users: me.blockedUsers }).eq("id", me.id);
+          }
+        });
+
+        const ta = $("messageTextarea");
+        ta.addEventListener("input", () => {
+          ta.style.height = "auto";
+          ta.style.height = Math.min(ta.scrollHeight, 120) + "px";
+          updateComposerButtonState();
+          checkGroupMentionsPopover();
+
+          if (ta.value.trim().length > 0) {
+            setTypingState("typing");
+            clearTimeout(typingTimeout);
+            typingTimeout = setTimeout(() => setTypingState(null), 2500);
+          } else {
+            setTypingState(null);
+          }
+        });
+
+        ta.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            const txt = ta.value.trim();
+            if (txt) {
+              ta.value = "";
+              ta.style.height = "auto";
+              $("mentionPopover").classList.add("hidden");
+              updateComposerButtonState();
+              sendMessage({ type: "text", text: txt });
+            }
+          }
+        });
+
+        $("btnSendOrMic").addEventListener("click", () => {
+          const isRecording = !$("recordingBar").classList.contains("hidden");
+          if (isRecording) {
+            stopVoiceRecording(false);
+            return;
+          }
+          const txt = ta.value.trim();
+          if (txt) {
+            ta.value = "";
+            ta.style.height = "auto";
+            $("mentionPopover").classList.add("hidden");
+            updateComposerButtonState();
+            sendMessage({ type: "text", text: txt });
+          } else {
+            startVoiceRecording();
+          }
+        });
+
+        $("cancelRecordingBtn").addEventListener("click", () => stopVoiceRecording(true));
+
+        $("emojiGrid").innerHTML = EMOJIS.map((em) => `<button type="button" class="emoji-btn">${em}</button>`).join("");
         $("emojiGrid").addEventListener("click", (e) => {
-          const btn = e.target.closest("[data-pick-emoji]");
+          const btn = e.target.closest(".emoji-btn");
           if (!btn) return;
-          const ta = $("messageTextarea");
-          ta.value += btn.dataset.pickEmoji;
+          ta.value += btn.textContent;
           ta.focus();
           updateComposerButtonState();
         });
 
-        // Attachments & Poll Menu
+        $("btnEmojiToggle").addEventListener("click", (e) => {
+          e.stopPropagation();
+          $("attachPopover").classList.add("hidden");
+          $("emojiPickerPopover").classList.toggle("hidden");
+        });
+
         $("btnAttachToggle").addEventListener("click", (e) => {
           e.stopPropagation();
           $("emojiPickerPopover").classList.add("hidden");
-          $("mentionPopover").classList.add("hidden");
           $("attachPopover").classList.toggle("hidden");
         });
 
@@ -5792,8 +5912,7 @@
               type: "image",
               mediaUrl: publicUrl,
               fileName: file.name,
-              fileSize: file.size,
-              fileMime: file.type
+              fileSize: file.size
             });
           } catch (err) {
             showToast(err.message);
@@ -5805,7 +5924,7 @@
           const file = e.target.files[0];
           if (!file) return;
           if (file.size > 15 * 1024 * 1024) {
-            showToast("הקובץ גדול מדי (מקסימום 15MB).");
+            showToast("גודל הקובץ חורג מ-15MB.");
             e.target.value = "";
             return;
           }
@@ -5825,63 +5944,105 @@
           e.target.value = "";
         });
 
-        // Composer Textarea, @mentions & Send/Mic Button
-        const ta = $("messageTextarea");
-        ta.addEventListener("input", () => {
-          ta.style.height = "auto";
-          ta.style.height = Math.min(ta.scrollHeight, 120) + "px";
-          updateComposerButtonState();
+        $("closeDrawerBtn").addEventListener("click", closeRightDrawer);
+        $("modalBackdrop").addEventListener("click", (e) => {
+          if (e.target === $("modalBackdrop")) closeModal();
+        });
 
-          // Group @mention autocomplete check
-          const chat = state.chats[state.activeChatId];
-          const cursorPos = ta.selectionStart || ta.value.length;
-          const textBeforeCursor = ta.value.slice(0, cursorPos);
-          const mentionMatch = textBeforeCursor.match(/(?:^|\s)@([a-zA-Z0-9._-]*)$/);
-
-          if (chat && chat.type === "group" && mentionMatch) {
-            const q = mentionMatch[1].toLowerCase();
-            const candidates = chat.participants
-              .filter((pid) => pid !== state.currentUserId)
-              .map((pid) => state.users[pid])
-              .filter((u) => u && (u.username.toLowerCase().includes(q) || u.fullName.toLowerCase().includes(q)));
-
-            if (candidates.length > 0) {
-              $("mentionList").innerHTML = candidates.map((u) => `
-                <button type="button" class="attach-menu-item" data-pick-mention="${escapeHtml(u.username)}">
-                  ${renderAvatarHTML(u, "sm", false)}
-                  <div>
-                    <div style="font-size:13.5px;font-weight:700;">${escapeHtml(u.fullName)}</div>
-                    <div style="font-size:11.5px;color:var(--text-muted);" dir="ltr">@${escapeHtml(u.username)}</div>
-                  </div>
-                </button>
-              `).join("");
-              $("mentionPopover").classList.remove("hidden");
-
-              $("mentionList").querySelectorAll("[data-pick-mention]").forEach((mBtn) => {
-                mBtn.onclick = () => {
-                  const uname = mBtn.dataset.pickMention;
-                  const replaced = textBeforeCursor.replace(/@([a-zA-Z0-9._-]*)$/, `@${uname} `);
-                  ta.value = replaced + ta.value.slice(cursorPos);
-                  $("mentionPopover").classList.add("hidden");
-                  ta.focus();
-                  updateComposerButtonState();
-                };
-              });
-            } else {
-              $("mentionPopover").classList.add("hidden");
-            }
-          } else {
-            $("mentionPopover").classList.add("hidden");
+        document.addEventListener("click", (e) => {
+          if (!e.target.closest("#msgContextMenu") && !e.target.closest("[data-open-menu]")) {
+            closeContextMenu();
           }
-
-          if (ta.value.trim().length > 0 && !(chat && isSelfChat(chat))) {
-            setTypingState("typing");
-            clearTimeout(typingTimeout);
-            typingTimeout = setTimeout(() => setTypingState(null), 2600);
-          } else {
-            setTypingState(null);
+          if (!e.target.closest("#emojiPickerPopover") && !e.target.closest("#btnEmojiToggle")) {
+            $("emojiPickerPopover").classList.add("hidden");
+          }
+          if (!e.target.closest("#attachPopover") && !e.target.closest("#btnAttachToggle")) {
+            $("attachPopover").classList.add("hidden");
+          }
+          if (!e.target.closest("#mentionPopover") && !e.target.closest("#messageTextarea")) {
+            $("mentionPopover").classList.add("hidden");
           }
         });
 
-        ta.addEventListener("keydown", async (e) => {
-          if (e.key
+        document.addEventListener("visibilitychange", async () => {
+          if (!state.currentUserId) return;
+          if (!document.hidden) {
+            await updateMyPresence(true);
+            await markMessagesDeliveredAndRead();
+            renderAll();
+          } else {
+            await updateMyPresence(false);
+          }
+        });
+
+        window.addEventListener("beforeunload", () => {
+          if (state.currentUserId && sb) {
+            sb.from("profiles").update({
+              is_online: false,
+              last_seen: new Date().toISOString()
+            }).eq("id", state.currentUserId);
+          }
+        });
+      }
+
+      /* ===================== MASTER RENDER & HEARTBEAT ===================== */
+      function renderAll() {
+        if (!state.currentUserId) return;
+        renderSidebar();
+        if (state.activeChatId) {
+          renderActiveChat();
+        }
+      }
+
+      setInterval(async () => {
+        if (!state.currentUserId) return;
+        if (!document.hidden) {
+          await updateMyPresence(true);
+        }
+        renderSidebar();
+        if (state.activeChatId) renderActiveChat();
+      }, 20000);
+
+      /* ===================== BOOTSTRAP ===================== */
+      async function initApp() {
+        loadLocalUISettings();
+        applySettingsToDOM();
+        initAuthUI();
+        bindGlobalEvents();
+
+        if (!sb) {
+          showAuthScreen(false);
+          showToast("לא ניתן היה לטעון את ספריית הענן. בדוק חיבור לאינטרנט.");
+          return;
+        }
+
+        // Fallback safety timer so the loading screen can NEVER get stuck
+        const failsafeTimer = setTimeout(() => {
+          if (!$("loadingScreen").classList.contains("hidden")) {
+            showAuthScreen(false);
+          }
+        }, 5000);
+
+        try {
+          await fetchGlobalAppSettings();
+          const { data } = await withTimeout(sb.auth.getSession(), 4000);
+          const session = data?.session;
+          if (session && session.user) {
+            requestBrowserNotificationPermission();
+            await completeLoginFlow(session.user.id, session.user);
+          } else {
+            showAuthScreen(false);
+          }
+        } catch (err) {
+          console.error("Session restore error:", err);
+          showAuthScreen(false);
+        } finally {
+          clearTimeout(failsafeTimer);
+        }
+      }
+
+      initApp();
+    })();
+  </script>
+</body>
+</html>
